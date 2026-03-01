@@ -1,42 +1,161 @@
-{
-  "name": "react-example",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "engines": {
-    "node": ">=20.0.0"
-  },
-  "scripts": {
-    "dev": "tsx server.ts",
-    "start": "tsx server.ts",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@google/genai": "^1.29.0",
-    "@tailwindcss/vite": "^4.1.14",
-    "@vitejs/plugin-react": "^5.0.4",
-    "better-sqlite3": "^12.4.1",
-    "clsx": "^2.1.1",
-    "date-fns": "^4.1.0",
-    "dotenv": "^17.2.3",
-    "express": "^4.21.2",
-    "lucide-react": "^0.546.0",
-    "motion": "^12.23.24",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "react-router-dom": "^7.13.1",
-    "tailwind-merge": "^3.5.0",
-    "tsx": "^4.21.0",
-    "vite": "^6.2.0"
-  },
-  "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^22.14.0",
-    "autoprefixer": "^10.4.21",
-    "tailwindcss": "^4.1.14",
-    "typescript": "~5.8.2"
+import express from 'express';
+import { createServer as createViteServer } from 'vite';
+import path from 'path';
+import db from './db.js';
+
+async function startServer() {
+  const app = express();
+  const PORT = process.env.PORT || 8080;
+
+  app.use(express.json());
+
+  // API Routes
+
+  // Auth
+  app.post('/api/auth/login', (req, res) => {
+    const { email, password } = req.body;
+    const user = db.prepare('SELECT * FROM users WHERE email = ? AND password = ?').get(email, password);
+    
+    if (user) {
+      res.json({ user });
+    } else {
+      res.status(401).json({ error: 'Invalid credentials' });
+    }
+  });
+
+  app.post('/api/auth/register', (req, res) => {
+    const { name, email, phone, password, role = 'disciple', disciplerName, disciplerPhone, disciplerEmail } = req.body;
+    try {
+      const info = db.prepare('INSERT INTO users (name, email, phone, password, role, discipler_name, discipler_phone, discipler_email) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(name, email, phone, password, role, disciplerName || null, disciplerPhone || null, disciplerEmail || null);
+      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+      res.json({ user });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  });
+
+  // Courses
+  app.get('/api/courses', (req, res) => {
+    const courses = db.prepare('SELECT * FROM courses').all();
+    res.json(courses);
+  });
+
+  app.get('/api/courses/:id/modules', (req, res) => {
+    const modules = db.prepare('SELECT * FROM modules WHERE course_id = ? ORDER BY module_number').all(req.params.id);
+    res.json(modules);
+  });
+
+  app.get('/api/modules/:id', (req, res) => {
+    const module = db.prepare('SELECT * FROM modules WHERE id = ?').get(req.params.id);
+    if (module) {
+      const quizzes = db.prepare('SELECT id, question, options FROM quizzes WHERE module_id = ?').all(req.params.id);
+      res.json({ ...module, quizzes: quizzes.map((q: any) => ({ ...q, options: JSON.parse(q.options) })) });
+    } else {
+      res.status(404).json({ error: 'Module not found' });
+    }
+  });
+
+  // Quiz Submission
+  app.post('/api/modules/:id/submit', (req, res) => {
+    const { userId, answers } = req.body; // answers: { quizId: selectedOptionIndex }
+    const moduleId = req.params.id;
+
+    const quizzes = db.prepare('SELECT id, correct_option FROM quizzes WHERE module_id = ?').all(moduleId) as { id: number, correct_option: number }[];
+    
+    if (quizzes.length === 0) {
+      return res.status(400).json({ error: 'No quizzes found for this module' });
+    }
+
+    let correctCount = 0;
+    quizzes.forEach(q => {
+      if (answers[q.id] === q.correct_option) {
+        correctCount++;
+      }
+    });
+
+    const score = (correctCount / quizzes.length) * 100;
+    const passed = score >= 60;
+
+    try {
+      db.prepare(`
+        INSERT INTO user_progress (user_id, module_id, score, passed)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, module_id) DO UPDATE SET
+        score = excluded.score, passed = excluded.passed
+      `).run(userId, moduleId, score, passed ? 1 : 0);
+
+      res.json({ score, passed });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // User Progress
+  app.get('/api/users/:id/progress', (req, res) => {
+    const progress = db.prepare('SELECT * FROM user_progress WHERE user_id = ?').all(req.params.id);
+    res.json(progress);
+  });
+
+  // Admin: Users
+  app.get('/api/admin/users', (req, res) => {
+    const users = db.prepare('SELECT id, name, email, phone, role, created_at FROM users').all();
+    res.json(users);
+  });
+
+  // Admin: Add Module
+  app.post('/api/admin/modules', (req, res) => {
+    const { courseId, moduleNumber, title, content, quizzes } = req.body;
+    
+    const insertModule = db.transaction(() => {
+      const info = db.prepare('INSERT INTO modules (course_id, module_number, title, content) VALUES (?, ?, ?, ?)').run(courseId, moduleNumber, title, content);
+      const moduleId = info.lastInsertRowid;
+      
+      const insertQuiz = db.prepare('INSERT INTO quizzes (module_id, question, options, correct_option) VALUES (?, ?, ?, ?)');
+      for (const q of quizzes) {
+        insertQuiz.run(moduleId, q.question, JSON.stringify(q.options), q.correct_option);
+      }
+      return moduleId;
+    });
+
+    try {
+      const id = insertModule();
+      res.json({ success: true, moduleId: id });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Donations
+  app.post('/api/donations', (req, res) => {
+    const { userId, name, email, amount, category } = req.body;
+    try {
+      const result = db.prepare(`
+        INSERT INTO donations (user_id, name, email, amount, category, status)
+        VALUES (?, ?, ?, ?, ?, 'completed')
+      `).run(userId || null, name, email, amount, category);
+      res.json({ success: true, id: result.lastInsertRowid });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  });
+
+  // Vite middleware for development
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static('dist'));
+    app.get('*', (req, res) => {
+      res.sendFile(path.resolve('dist/index.html'));
+    });
   }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
 }
+
+startServer();
