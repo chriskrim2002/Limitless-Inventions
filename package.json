@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node dist-server/server.js",
-    "build": "vite build && npm run build:server",
+    "build": "node build.js && vite build && npm run build:server",
     "build:server": "tsc server.ts db.ts --outDir dist-server --module ESNext --moduleResolution bundler --target ES2022 --allowJs",
     "preview": "vite preview",
     "clean": "rm -rf dist",
